@@ -1,5 +1,6 @@
 VENDOR	ChilliSpot	14559 ChilliSpot
 
+# Octets and bandwidth limits
 ATTRIBUTE	ChilliSpot-Max-Input-Octets		1	integer	ChilliSpot
 ATTRIBUTE	ChilliSpot-Max-Output-Octets		2	integer	ChilliSpot
 ATTRIBUTE	ChilliSpot-Max-Total-Octets		3	integer	ChilliSpot
@@ -9,9 +10,17 @@ ATTRIBUTE	ChilliSpot-Config			6	string	ChilliSpot
 ATTRIBUTE	ChilliSpot-Lang				7	string	ChilliSpot
 ATTRIBUTE	ChilliSpot-Version			8	string	ChilliSpot
 ATTRIBUTE	ChilliSpot-OriginalURL			9	string	ChilliSpot
+
+# Gigawords (64-bit octet counters)
 ATTRIBUTE	ChilliSpot-Max-Input-Gigawords		21	integer	ChilliSpot
 ATTRIBUTE	ChilliSpot-Max-Output-Gigawords		22	integer	ChilliSpot
 ATTRIBUTE	ChilliSpot-Max-Total-Gigawords		23	integer	ChilliSpot
-ATTRIBUTE	ChilliSpot-UAM-Allowed			100	string ChilliSpot
-ATTRIBUTE	ChilliSpot-MAC-Allowed			101	string ChilliSpot
-ATTRIBUTE	ChilliSpot-Interval			102	integer ChilliSpot
+
+# Location
+ATTRIBUTE	ChilliSpot-Location			25	string	ChilliSpot
+
+# Garden accounting
+ATTRIBUTE	ChilliSpot-Garden-Input-Octets		80	integer	ChilliSpot
+ATTRIBUTE	ChilliSpot-Garden-Output-Octets		81	integer	ChilliSpot
+ATTRIBUTE	ChilliSpot-Garden-Input-Gigawords	82	integer	ChilliSpot
+ATTRIBUTE	ChilliSpot-Garden-Output-Gigawords	83	integer	ChilliSpot

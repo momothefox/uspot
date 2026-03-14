@@ -22,6 +22,9 @@ let uci = require('uci').cursor();
 let rtnl = require('rtnl');
 import { ulog_open, ulog, ULOG_SYSLOG, LOG_DAEMON, LOG_DEBUG, ERR } from 'log';
 
+push(REQUIRE_SEARCH_PATH, "/usr/share/uspot/*.uc");
+let garden = require('garden');
+
 let uspots = {};
 let devices = {};
 
@@ -38,9 +41,15 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 			device,
 			debug: d.debug,
 			disconnect_delay: d.disconnect_delay,
+			garden_host: d.garden_host,
+			garden_network: d.garden_network,
 		},
 		clients: {},
 		neighs: {},
+		garden: {
+			setname: `uspot_garden_${d[".name"]}`,
+			resolved: {},
+		},
 		};
 
 		devices[device] = d[".name"];
@@ -241,14 +250,85 @@ function flush_nftsets()
 	}
 }
 
+/**
+ * Initialize garden sets and forwarding rules for all uspots.
+ * Creates nftables sets and populates them with configured garden IPs/networks.
+ */
+function garden_init()
+{
+	for (let name, uspot in uspots) {
+		let settings = uspot.settings;
+		let gsetname = uspot.garden.setname;
+
+		// Skip if no garden config
+		if (!settings.garden_host && !settings.garden_network)
+			continue;
+
+		// Create the garden nft set
+		garden.create_garden_set(gsetname);
+
+		// Create garden accounting counters
+		garden.create_garden_counters(name);
+
+		// Build and apply elements
+		let result = garden.build_elements(settings);
+		if (length(result.elements)) {
+			garden.apply_garden_set(gsetname, result.elements);
+			uspot.garden.resolved = result.resolved;
+			debug(name, `garden: added ${length(result.elements)} elements to ${gsetname}`);
+		}
+
+		// Add counting rules BEFORE the accept rule (counters don't affect forwarding)
+		garden.add_garden_counter_rules(settings.device, gsetname, name);
+
+		// Add forwarding rule for garden traffic
+		garden.add_garden_rule(settings.device, gsetname, 'forward');
+	}
+}
+
+/**
+ * Cleanup all garden sets, rules, and counters.
+ */
+function garden_cleanup()
+{
+	for (let name, uspot in uspots) {
+		let gsetname = uspot.garden.setname;
+		garden.remove_garden_counter_rules(name);
+		garden.remove_garden_rules(gsetname);
+		garden.destroy_garden_counters(name);
+		garden.destroy_garden_set(gsetname);
+	}
+}
+
+/**
+ * Periodic garden DNS re-resolution.
+ * Re-resolves hostnames and updates nftables sets if IPs have changed.
+ */
+function garden_refresh()
+{
+	for (let name, uspot in uspots) {
+		let settings = uspot.settings;
+		if (!settings.garden_host)
+			continue;
+
+		let result = garden.build_elements(settings);
+		if (length(result.elements)) {
+			garden.apply_garden_set(uspot.garden.setname, result.elements);
+			uspot.garden.resolved = result.resolved;
+		}
+	}
+}
+
 function start()
 {
 	flush_nftsets();
+	garden_init();
 	rtnl.listener(rtnl_neigh_cb, null, [ rtnl.const.RTNLGRP_NEIGH ]);
 }
 
 function stop()
 {
+	garden_cleanup();
 	flush_nftsets();
 	// XXX flush conntrack?
 }
@@ -403,10 +483,96 @@ function run_service() {
 			ip:"",
 		}
 	},
+	garden_set: {
+		call: function(req) {
+			let uspot_name = req.args.interface;
+			let elements = req.args.elements;
+
+			if (!uspot_name || !elements)
+				return ubus.STATUS_INVALID_ARGUMENT;
+			if (!(uspot_name in uspots))
+				return ubus.STATUS_INVALID_ARGUMENT;
+
+			let gsetname = uspots[uspot_name].garden.setname;
+
+			// Ensure set exists
+			garden.create_garden_set(gsetname);
+
+			// Apply elements (additive - does not flush first)
+			let elem_str = join(', ', elements);
+			let ret = system(`nft add element inet fw4 ${gsetname} { ${elem_str} }`);
+
+			return { "success": ret == 0 };
+		},
+		/*
+		 Add elements to a uspot's garden set.
+		 @param interface: REQUIRED: target uspot
+		 @param elements: REQUIRED: array of IP/network strings to add
+		 */
+		args: {
+			interface:"",
+			elements:[],
+		}
+	},
+	garden_flush: {
+		call: function(req) {
+			let uspot_name = req.args.interface;
+
+			if (!uspot_name)
+				return ubus.STATUS_INVALID_ARGUMENT;
+			if (!(uspot_name in uspots))
+				return ubus.STATUS_INVALID_ARGUMENT;
+
+			let gsetname = uspots[uspot_name].garden.setname;
+			system(`nft flush set inet fw4 ${gsetname} 2>/dev/null`);
+
+			return { "success": true };
+		},
+		/*
+		 Flush all elements from a uspot's garden set.
+		 @param interface: REQUIRED: target uspot
+		 */
+		args: {
+			interface:"",
+		}
+	},
+	garden_list: {
+		call: function(req) {
+			let uspot_name = req.args.interface;
+
+			if (!uspot_name)
+				return ubus.STATUS_INVALID_ARGUMENT;
+			if (!(uspot_name in uspots))
+				return ubus.STATUS_INVALID_ARGUMENT;
+
+			let gsetname = uspots[uspot_name].garden.setname;
+			let cmd = `nft -j list set inet fw4 ${gsetname} 2>/dev/null`;
+			let nft = json_cmd(cmd);
+			let elem = nft?.nftables?.[1]?.set?.elem;
+
+			return {
+				setname: gsetname,
+				elements: elem || [],
+				resolved: uspots[uspot_name].garden.resolved,
+			};
+		},
+		/*
+		 List elements in a uspot's garden set.
+		 @param interface: REQUIRED: target uspot
+		 */
+		args: {
+			interface:"",
+		}
+	},
 	});
 
 	try {
 		start();
+		// Garden DNS refresh timer - re-resolve hostnames every 300s
+		uloop.timer(300000, function() {
+			garden_refresh();
+			this.set(300000);
+		});
 		uloop.run();
 	} catch (e) {
 		warn(`Error: ${e}\n${e.stacktrace[0].context}`);

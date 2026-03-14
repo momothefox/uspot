@@ -13,6 +13,7 @@ let ubus = require('ubus');
 let uconn = ubus.connect();
 let uci = require('uci').cursor();
 let lib = require('uspotlib');
+let garden = require('garden');
 let uacct;
 import { ulog_open, ulog, ULOG_SYSLOG, LOG_DAEMON, LOG_DEBUG, ERR, WARN, INFO } from 'log';
 
@@ -48,9 +49,9 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 			acct_server: d.acct_server,
 			acct_secret: d.acct_secret,
 			acct_port: d.acct_port || 1813,
-			acct_server2: d.acct_server,
-			acct_secret2: d.acct_secret,
-			acct_port2: d.acct_port || 1813,
+			acct_server2: d.acct_server2,
+			acct_secret2: d.acct_secret2,
+			acct_port2: d.acct_port2 || 1813,
 			acct_proxy: d.acct_proxy,
 			acct_interval: d.acct_interval,
 			swapio: d.swapio,
@@ -68,6 +69,10 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 			ratelimit_def: d.ratelimit_def,
 			counters: d.counters,
 			debug: d.debug,
+			garden_host: d.garden_host,
+			garden_network: d.garden_network,
+			persist_file: d.persist_file,
+			location: d.location,
 		},
 		clients: {},
 		};
@@ -190,12 +195,17 @@ function radius_init(uspot, mac, payload, auth) {
 		payload['NAS-IP-Address'] = settings.nas_ip;	// allow overriding libradcli's idea of NAS-IP
 	if (settings.location_name)
 		payload['WISPr-Location-Name'] = settings.location_name;
+	if (settings.location)
+		payload['ChilliSpot-Location'] = settings.location;
+
+	// Add version identifier
+	payload['ChilliSpot-Version'] = 'uspot';
 
 	if (!auth && mac) {
 		// dealing with client accounting
 		let client = uspots[uspot].clients[mac];
 		let radius = client.radius.request;
-		for (let key in [ 'Acct-Session-Id', 'Framed-IP-Address', 'Called-Station-Id', 'Calling-Station-Id', 'NAS-IP-Address', 'NAS-Port-Type', 'User-Name', 'WISPr-Location-Name', 'Chargeable-User-Identity' ])
+		for (let key in [ 'Acct-Session-Id', 'Framed-IP-Address', 'Called-Station-Id', 'Calling-Station-Id', 'NAS-IP-Address', 'NAS-Port-Type', 'User-Name', 'WISPr-Location-Name', 'Chargeable-User-Identity', 'ChilliSpot-Location' ])
 			if (radius[key])
 				payload[key] = radius[key];
 	}
@@ -265,6 +275,24 @@ function radius_acct(uspot, mac, payload) {
 	}
 	if (client.radius?.reply?.Class)
 		payload.Class = client.radius.reply.Class;
+
+	// Add garden accounting counters if garden is configured
+	if (payload.acct_type != radat_start) {
+		let garden_data = garden.read_garden_counters(uspot);
+		if (garden_data) {
+			if (+settings.swapio) {
+				payload['ChilliSpot-Garden-Input-Octets'] = garden_data.bytes_out & 0xffffffff;
+				payload['ChilliSpot-Garden-Input-Gigawords'] = garden_data.bytes_out >> 32;
+				payload['ChilliSpot-Garden-Output-Octets'] = garden_data.bytes_in & 0xffffffff;
+				payload['ChilliSpot-Garden-Output-Gigawords'] = garden_data.bytes_in >> 32;
+			} else {
+				payload['ChilliSpot-Garden-Input-Octets'] = garden_data.bytes_in & 0xffffffff;
+				payload['ChilliSpot-Garden-Input-Gigawords'] = garden_data.bytes_in >> 32;
+				payload['ChilliSpot-Garden-Output-Octets'] = garden_data.bytes_out & 0xffffffff;
+				payload['ChilliSpot-Garden-Output-Gigawords'] = garden_data.bytes_out >> 32;
+			}
+		}
+	}
 
 	radius_call(payload);
 }
@@ -447,6 +475,120 @@ function client_quotalimit(uspot, mac) {
 }
 
 /**
+ * Parse CoovaChilli-Config attribute value.
+ * Format: "key1=val1;key2=val2" or "key1=val1\nkey2=val2"
+ * Known keys: uamallowed, uamdomain
+ *
+ * @param {string} config_str - the ChilliSpot-Config attribute value
+ * @returns {object} parsed key-value pairs
+ */
+function parse_chillispot_config(config_str) {
+	let result = {};
+	if (!config_str)
+		return result;
+
+	// Split by semicolon or newline
+	for (let part in split(config_str, /[;\n]/)) {
+		let kv = match(trim(part), /^([^=]+)=(.*)$/);
+		if (kv)
+			result[kv[1]] = kv[2];
+	}
+
+	return result;
+}
+
+/**
+ * Apply per-session walled garden from RADIUS ChilliSpot-Config attribute.
+ * Parses "uamallowed=host1,host2,10.0.0.0/8" and adds resolved IPs to the
+ * garden nftables set via uspotfilter.
+ *
+ * @param {string} uspot the target uspot
+ * @param {string} mac the client MAC address
+ */
+function client_session_garden(uspot, mac) {
+	let client = uspots[uspot].clients[mac];
+
+	if (!client.radius?.reply)
+		return;
+
+	let config_str = client.radius.reply['ChilliSpot-Config'];
+	if (!config_str)
+		return;
+
+	let parsed = parse_chillispot_config(config_str);
+	let allowed = parsed.uamallowed;
+	if (!allowed)
+		return;
+
+	let hosts = split(allowed, ',');
+	let elements = [];
+
+	for (let host in hosts) {
+		host = trim(host);
+		if (!host || !length(host))
+			continue;
+
+		// Check if it's an IP/network (contains digits and dots/slash)
+		if (match(host, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/)) {
+			push(elements, host);
+		} else {
+			// It's a hostname, resolve it
+			let addrs = garden.resolve_host(host);
+			for (let addr in addrs)
+				push(elements, addr);
+		}
+	}
+
+	if (length(elements)) {
+		// Store session garden elements for cleanup on disconnect
+		client.session_garden = elements;
+
+		// Add to garden set via uspotfilter
+		uconn.error();
+		uconn.call('uspotfilter', 'garden_set', {
+			interface: uspot,
+			elements,
+		});
+
+		if (!uconn.error())
+			debug(uspot, mac + ' session garden: added ' + length(elements) + ' elements');
+	}
+}
+
+/**
+ * Remove per-session walled garden elements on disconnect.
+ * NOTE: Currently does not reference-count. This means if two sessions
+ * share a garden destination, removing one session may affect the other.
+ * For production use, garden IPs should be re-applied from static config
+ * on session removal if there's overlap concern.
+ *
+ * @param {string} uspot the target uspot
+ * @param {string} mac the client MAC address
+ */
+function client_session_garden_remove(uspot, mac) {
+	let client = uspots[uspot].clients[mac];
+	if (!client?.session_garden || !length(client.session_garden))
+		return;
+
+	// Rather than trying to remove individual elements (which could break
+	// static garden entries), we rebuild the garden set from config.
+	// This is safe and correct, at the cost of a brief set rebuild.
+	let settings = uspots[uspot].settings;
+	if (settings.garden_host || settings.garden_network) {
+		let result = garden.build_elements(settings);
+		uconn.call('uspotfilter', 'garden_flush', { interface: uspot });
+		if (length(result.elements)) {
+			uconn.call('uspotfilter', 'garden_set', {
+				interface: uspot,
+				elements: result.elements,
+			});
+		}
+	}
+
+	debug(uspot, mac + ' session garden: cleaned up');
+}
+
+/**
  * Add an authenticated but not yet validated client to the backend.
  * This function adds a client that passed authentication, but hasn't yet been enabled.
  * If the client isn't subsequently enabled, it will be purged after a 60s grace period.
@@ -533,6 +675,9 @@ function client_enable(uspot, mac) {
 		// apply traffic limit/accouting rules, if any
 		client_quotalimit(uspot, mac);
 
+		// apply per-session walled garden from RADIUS ChilliSpot-Config
+		client_session_garden(uspot, mac);
+
 		return true;
 	}
 
@@ -554,6 +699,9 @@ function client_remove(uspot, mac, reason) {
 		address: mac,
 	};
 	let device = uspots[uspot].settings.device;
+
+	// clean up per-session walled garden before removing from uspotfilter
+	client_session_garden_remove(uspot, mac);
 
 	uconn.error();	// XXX REVISIT clear error
 	uconn.call('uspotfilter', 'client_remove', payload);
@@ -694,6 +842,146 @@ function accounting(uspot) {
 	}
 }
 
+/**
+ * Save all active sessions to a JSON persistence file.
+ * Only saves clients that are enabled (state == 1) and have RADIUS data.
+ */
+function persist_save()
+{
+	for (let uspot, data in uspots) {
+		let persist_file = data.settings.persist_file;
+		if (!persist_file)
+			continue;
+
+		let clients_to_save = {};
+		let count = 0;
+
+		for (let mac, client in data.clients) {
+			if (!client.state || !client.radius?.request)
+				continue;
+
+			clients_to_save[mac] = {
+				connect: client.connect,
+				state: client.state,
+				interval: client.interval,
+				session: client.session,
+				idle: client.idle,
+				next_interim: client.next_interim,
+				radius: client.radius,
+				data: client.data,
+				maxup: client.maxup,
+				maxdown: client.maxdown,
+				maxtotal: client.maxtotal,
+				session_garden: client.session_garden,
+			};
+			count++;
+		}
+
+		let payload = {
+			uspot,
+			timestamp: time(),
+			sessionid: data.sessionid,
+			clients: clients_to_save,
+		};
+
+		let f = fs.open(persist_file, 'w');
+		if (f) {
+			f.write(sprintf('%J', payload));
+			f.close();
+			debug(uspot, `persisted ${count} sessions to ${persist_file}`);
+		}
+		else {
+			ERR(`${uspot}: failed to write persist file: ${persist_file}`);
+		}
+	}
+}
+
+/**
+ * Restore sessions from persistence file.
+ * Re-creates clients and re-enables them in uspotfilter (nft set).
+ */
+function persist_restore()
+{
+	for (let uspot, data in uspots) {
+		let persist_file = data.settings.persist_file;
+		if (!persist_file)
+			continue;
+
+		let f = fs.open(persist_file, 'r');
+		if (!f)
+			continue;
+
+		let content = f.read('all');
+		f.close();
+
+		let saved;
+		try {
+			saved = json(content);
+		} catch (e) {
+			ERR(`${uspot}: failed to parse persist file: ${e}`);
+			continue;
+		}
+
+		if (!saved?.clients || saved.uspot != uspot) {
+			WARN(`${uspot}: persist file mismatch or empty`);
+			continue;
+		}
+
+		let restored = 0;
+
+		for (let mac, client_data in saved.clients) {
+			// Recreate the client
+			data.clients[mac] = {
+				...client_data,
+			};
+
+			// Re-enable in uspotfilter (add MAC to nft set)
+			uconn.error();
+			uconn.call('uspotfilter', 'client_set', {
+				interface: uspot,
+				address: mac,
+				state: 1,
+				data: { connect: client_data.connect },
+			});
+
+			if (uconn.error()) {
+				WARN(`${uspot}: failed to restore client ${mac} in uspotfilter`);
+				delete data.clients[mac];
+				continue;
+			}
+
+			// Re-add to eBPF accounting if enabled
+			if (+data.settings.counters && uacct) {
+				let tx = !!(client_data.maxup || client_data.maxtotal);
+				let rx = !!(client_data.maxdown || client_data.maxtotal);
+				// Always enable counters if accounting is on
+				if (data.settings.accounting)
+					tx = rx = true;
+				uacct.client_add(data.settings.device, mac, tx, rx);
+			}
+
+			// Re-apply ratelimiting
+			client_ratelimit(uspot, mac);
+
+			// Re-apply session garden
+			if (client_data.session_garden && length(client_data.session_garden)) {
+				uconn.call('uspotfilter', 'garden_set', {
+					interface: uspot,
+					elements: client_data.session_garden,
+				});
+			}
+
+			restored++;
+		}
+
+		if (restored)
+			INFO(`${uspot}: restored ${restored} sessions from ${persist_file}`);
+
+		// Clean up the persist file after restore
+		fs.unlink(persist_file);
+	}
+}
+
 function start()
 {
 	let seen = {};
@@ -707,12 +995,12 @@ function start()
 		// ensure target device is available
 		let count = 10;
 		while (--count && !uconn.call('network.device','status', {name: device})) {
-			WARN(`${uspot}: cannot find device {$device}, retrying: ${count}`);
+			WARN(`${uspot}: cannot find device ${device}, retrying: ${count}`);
 			sleep(2000);
 		}
 
 		if (!count) {
-			ERR(`${uspot}: cannot find device {$device}, giving up!`);
+			ERR(`${uspot}: cannot find device ${device}, giving up!`);
 			delete uspots[uspot];
 			continue;
 		}
@@ -736,10 +1024,16 @@ function start()
 		seen[server][nasid] = 1;
 		radius_accton(uspot);
 	}
+
+	// Restore persisted sessions after all subsystems are ready
+	persist_restore();
 }
 
 function stop()
 {
+	// Save sessions before shutdown
+	persist_save();
+
 	for (let uspot, data in uspots) {
 		if (data.sessionid)	// we have previously sent Accounting-On
 			radius_acctoff(uspot);
@@ -785,7 +1079,17 @@ function das_coa_filter_changes(request)
 {
 	let changes = {};
 
-	for (let key in [ 'Session-Timeout', 'Idle-Timeout', 'Acct-Interim-Interval' ]) {
+	let coa_keys = [
+		'Session-Timeout', 'Idle-Timeout', 'Acct-Interim-Interval',
+		'WISPr-Bandwidth-Max-Up', 'WISPr-Bandwidth-Max-Down',
+		'ChilliSpot-Bandwidth-Max-Up', 'ChilliSpot-Bandwidth-Max-Down',
+		'ChilliSpot-Max-Input-Octets', 'ChilliSpot-Max-Output-Octets',
+		'ChilliSpot-Max-Total-Octets',
+		'ChilliSpot-Max-Input-Gigawords', 'ChilliSpot-Max-Output-Gigawords',
+		'ChilliSpot-Max-Total-Gigawords',
+	];
+
+	for (let key in coa_keys) {
 		if (key in request) {
 			changes[key] = request[key];
 			delete request[key];
@@ -796,20 +1100,59 @@ function das_coa_filter_changes(request)
 }
 
 // update a client with CoA changes
-function das_coa_update_client(client, changes)
+function das_coa_update_client(uspot, mac, client, changes)
 {
+	let bw_changed = false;
+	let quota_changed = false;
+
 	for (let key, val in changes) {
 		switch (key) {
 		case 'Acct-Interim-Interval':
-			client.interval = val;
+			client.interval = +val;
 			break;
 		case 'Session-Timeout':
-			client.session = val;
+			client.session = +val;
 			break;
 		case 'Idle-Timeout':
-			client.idle = val;
+			client.idle = +val;
+			break;
+		case 'WISPr-Bandwidth-Max-Up':
+		case 'WISPr-Bandwidth-Max-Down':
+		case 'ChilliSpot-Bandwidth-Max-Up':
+		case 'ChilliSpot-Bandwidth-Max-Down':
+			// Store in radius reply for client_ratelimit() to pick up
+			if (!client.radius)
+				client.radius = {};
+			if (!client.radius.reply)
+				client.radius.reply = {};
+			client.radius.reply[key] = +val;
+			bw_changed = true;
+			break;
+		case 'ChilliSpot-Max-Input-Octets':
+			client.maxup = (+val + ((+changes['ChilliSpot-Max-Input-Gigawords'] || 0) << 32)) || client.maxup;
+			quota_changed = true;
+			break;
+		case 'ChilliSpot-Max-Output-Octets':
+			client.maxdown = (+val + ((+changes['ChilliSpot-Max-Output-Gigawords'] || 0) << 32)) || client.maxdown;
+			quota_changed = true;
+			break;
+		case 'ChilliSpot-Max-Total-Octets':
+			client.maxtotal = (+val + ((+changes['ChilliSpot-Max-Total-Gigawords'] || 0) << 32)) || client.maxtotal;
+			quota_changed = true;
 			break;
 		}
+	}
+
+	// Re-apply bandwidth limits if changed
+	if (bw_changed)
+		client_ratelimit(uspot, mac);
+
+	// Enable counters for quota tracking if needed and not already active
+	if (quota_changed && +uspots[uspot].settings.counters && uacct) {
+		let tx = !!(client.maxup || client.maxtotal);
+		let rx = !!(client.maxdown || client.maxtotal);
+		if (!length(uacct.client_get(uspots[uspot].settings.device, mac)))
+			uacct.client_add(uspots[uspot].settings.device, mac, tx, rx);
 	}
 }
 
@@ -1137,7 +1480,7 @@ function run_service() {
 
 				if (address) {
 					let client = uspots[uspot].clients[address];
-					das_coa_update_client(client, changes);
+					das_coa_update_client(uspot, address, client, changes);
 					INFO(`${uspot} ${address} CoA update`);
 				}
 
@@ -1234,6 +1577,11 @@ function run_service() {
 			for (let uspot in uspots)
 				accounting(uspot);
 			this.set(10000);
+		});
+		// Periodic session persistence (every 60s)
+		uloop.timer(60000, function() {
+			persist_save();
+			this.set(60000);
 		});
 		uloop.run();
 	} catch (e) {

@@ -44,14 +44,36 @@ uspot supports Captive Portal API (RFC8908) with support for:
 - `seconds-remaining` (automatically set)
 - `bytes-remaining` (automatically set)
 
-uspot supports some basic RADIUS DAE (RFC5176) Disconnect and CoA operations over plaintext UDP,
-currently allowing client disconnection or update of `Session-Timeout`, `Idle-Timeout` and `Acct-Interim-Interval` attributes.
+uspot supports RADIUS DAE (RFC5176) Disconnect and CoA operations over plaintext UDP,
+allowing client disconnection or update of `Session-Timeout`, `Idle-Timeout`, `Acct-Interim-Interval`,
+bandwidth limits (`ChilliSpot-Bandwidth-Max-{Up,Down}`, `WISPr-Bandwidth-Max-{Up,Down}`),
+and data quotas (`ChilliSpot-Max-{Input,Output,Total}-{Octets,Gigawords}`) via Vendor-Specific attributes (vendor 14559).
 (see comments in [radius-das.c](src/radius-das.c) for details on which client-matching attributes are supported).
 
 In conjunction with [ratelimit](https://github.com/f00b4r0/ratelimit), uspot supports per-client bandwidth restriction
 (either via static configuration or through `WISPr-Bandwidth-Max-{Up,Down}`/`ChilliSpot-Bandwidth-Max-{Up,Down}` RADIUS attributes.
 
-uspot does not (and will not) support state persistence: restarting uspot will reset client state.
+### CoovaChilli compatibility extensions
+
+This fork adds the following CoovaChilli-compatible features:
+
+- **Walled garden**: Static pass-through by IP/domain via nftables sets, with periodic DNS re-resolution (300s).
+  Configured via `garden_host` and `garden_network` UCI list options.
+- **Per-session walled garden**: RADIUS can return `ChilliSpot-Config = "uamallowed=host1,host2,10.0.0.0/8"`
+  to grant per-session pass-through destinations. Elements are added to the garden nftables set on auth
+  and cleaned up on disconnect.
+- **Garden accounting**: Separate nftables counters track walled garden traffic, reported via
+  `ChilliSpot-Garden-{Input,Output}-{Octets,Gigawords}` VSAs in RADIUS accounting.
+- **Extended CoovaChilli dictionary**: Vendor 14559 dictionary with 18 attributes
+  covering all implemented features, compatible with FreeRADIUS.
+- **Session persistence**: Active sessions are saved to a JSON file (every 60s + on shutdown)
+  and restored on daemon restart, preserving client authentication state, bandwidth limits,
+  quotas, and session garden. Configured via `persist_file` UCI option.
+- **Enhanced CoA**: The DAE server parses Vendor-Specific (type 26) TLVs using the radcli dictionary,
+  enabling runtime changes to bandwidth, quotas, and timeouts via RADIUS CoA-Request.
+- **Location tracking**: `ChilliSpot-Location` VSA sent in RADIUS auth and accounting requests.
+  Configured via `location` UCI option.
+- **Version VSA**: `ChilliSpot-Version = "uspot"` sent in all RADIUS requests.
 
 ## License
 
@@ -319,8 +341,8 @@ Uspot _is_ a captive _portal_ after all. Bugs arising from using this hack will 
 
 ### radcli
 
-uspot does not install the dictionaries required by libradcli by default (to avoid conflicts).
-They are provided in [radcli/](files/etc/radcli/) for your convenience.
+The CoovaChilli dictionary (`dictionary.chillispot`) is installed by the uspot package to `/etc/radcli/`.
+Additional dictionaries required by libradcli are provided in [radcli/](files/etc/radcli/) for your convenience.
 
 ## UAM interface
 

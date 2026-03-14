@@ -56,3 +56,15 @@
 #	option mac_passwd ''		# OPTIONAL - Password sent for MAC-auth, defaults to formatted MAC address
 #	option mac_suffix ''		# OPTIONAL - suffix appended to username for MAC-auth
 #	option uam_sslurl ''		# OPTIONAL - base url to local UAM SSL (for HTTPS operation, requires valid SSL setup in uhttpd UAM config), e.g. "https://uspot.lan:3991/" - NB: trailing slash
+
+# walled garden (pass-through for unauthenticated clients):
+#	list garden_host 'portal.example.com'	# OPTIONAL - hostnames resolved to IPs and added to garden set (re-resolved every 300s)
+#	list garden_host 'cdn.example.com'
+#	list garden_network '10.0.0.0/8'	# OPTIONAL - IP networks/addresses added directly to garden set
+#	list garden_network '203.0.113.0/24'
+
+# session persistence:
+#	option persist_file ''		# OPTIONAL - path to session persistence file (JSON). If set, sessions survive restarts
+
+# location tracking:
+#	option location ''		# OPTIONAL - CoovaChilli-Location VSA sent in RADIUS requests

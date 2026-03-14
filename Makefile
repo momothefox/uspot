@@ -74,7 +74,7 @@ define Build/Compile
 endef
 
 define Package/uspot/install
-	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/share $(1)/usr/lib/ucode $(1)/etc/init.d $(1)/etc/config $(1)/lib/bpf
+	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/share $(1)/usr/lib/ucode $(1)/etc/init.d $(1)/etc/config $(1)/etc/radcli $(1)/lib/bpf
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/radius-client $(1)/usr/bin/radius-client
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uspot-das $(1)/usr/bin/uspot-das
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libuam.so $(1)/usr/lib/ucode/uam.so
@@ -83,6 +83,7 @@ define Package/uspot/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/uspot $(1)/etc/init.d/uspot
 	$(CP) $(PKG_BUILD_DIR)/files/usr/bin $(1)/usr/
 	$(CP) $(PKG_BUILD_DIR)/files/usr/share/uspot $(1)/usr/share/
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/etc/radcli/dictionary.chillispot $(1)/etc/radcli/dictionary.chillispot
 endef
 
 define Package/uspot-www/install

@@ -12,10 +12,11 @@
  This implementation supports a limited subset of valid RADIUS attributes.
  In particular it does not support: Service-Type or Message-Authenticator.
  In the table below, the following identification attributes are not supported:
- Acct-Multi-Session-Id, NAS-IPv6-Address, NAS-Port, Vendor-Specific, Acct-Multi-Session-Id,
+ Acct-Multi-Session-Id, NAS-IPv6-Address, NAS-Port, Acct-Multi-Session-Id,
  NAS-Port-Id, Framed-Interface-Id, Framed-IPv6-Prefix.
  It also does not send Error-Cause.
  It will however preserve Proxy-State, State and Class attributes in the response.
+ Vendor-Specific attributes (type 26) are supported for CoovaChilli (vendor 14559).
  Per RFC, non-supported attributes found in incoming messages will result in a NAK response.
 
  Per RFC5176:
@@ -78,6 +79,11 @@
 
 #define freeconst(p)		free((void *)(uintptr_t)(p))
 
+// compat defines for pre 1.3 libradcli
+#ifndef VENDOR_BIT_SIZE
+ #define VENDOR_BIT_SIZE 16
+#endif
+
 // RFC5176 DAE for RADIUS codes
 enum dae_codes {
 	DISCONNECT_REQUEST = 40,
@@ -119,6 +125,30 @@ struct radius_tlv {
 } __attribute__((packed));
 
 #define TLVP_DATA_LEN(tlvp)	(((tlvp)->len) - 2)	// TLV data len is len - 2*sizeof(uint8_t)
+
+// CoovaChilli vendor ID for Vendor-Specific attribute parsing
+#define VENDOR_CHILLISPOT	14559
+
+/*
+ Vendor-Specific Attribute format (RFC 2865 Section 5.26):
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |     Type (26) |    Length     |         Vendor-Id
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      Vendor-Id (cont)          | Vendor-Type   | Vendor-Length |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |    Attribute-Specific...
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ */
+struct radius_vsa {
+	uint32_t vendor_id;
+	uint8_t type;
+	uint8_t len;
+	uint8_t data[];
+} __attribute__((packed));
+
+#define VSA_DATA_LEN(vsap)	(((vsap)->len) - 2)
 
 static struct {
 	struct ubus_context *ctx;
@@ -184,6 +214,107 @@ radius_attr_name(uint8_t attrid)
 	}
 
 	return DA->name;
+}
+
+// Parse a Vendor-Specific (type 26) TLV and add sub-attributes to blobmsg.
+// Only processes CoovaChilli VSAs (vendor 14559). Sub-attribute types come from radcli dictionary.
+static int
+parse_vendor_specific(const struct radius_tlv *tlv, struct blob_buf *b)
+{
+	const uint8_t *data = tlv->data;
+	uint8_t data_len = TLVP_DATA_LEN(tlv);
+	uint32_t vendor_id;
+	uint8_t vsa_remaining;
+
+	// Need at least 4 bytes for vendor ID + 2 bytes for one sub-TLV header
+	if (data_len < sizeof(uint32_t) + 2)
+		return -1;
+
+	vendor_id = ntohl(*((uint32_t *)data));
+
+	// Only process CoovaChilli VSAs
+	if (vendor_id != VENDOR_CHILLISPOT) {
+		ULOG_INFO("ignoring VSA from unsupported vendor %u\n", vendor_id);
+		return -1;
+	}
+
+	data += sizeof(uint32_t);
+	vsa_remaining = data_len - sizeof(uint32_t);
+
+	// Iterate sub-TLVs within the VSA
+	while (vsa_remaining >= 2) {
+		uint8_t sub_type = data[0];
+		uint8_t sub_len = data[1];
+
+		if (sub_len < 2 || sub_len > vsa_remaining) {
+			ULOG_ERR("invalid VSA sub-TLV length %d\n", sub_len);
+			return -1;
+		}
+
+		// Look up attribute name from radcli dictionary
+		uint32_t radcli_id = sub_type | (vendor_id << VENDOR_BIT_SIZE);
+		DICT_ATTR *DA = rc_dict_getattr(das.rh, radcli_id);
+		if (!DA) {
+			ULOG_INFO("unknown ChilliSpot VSA sub-attribute %d, skipping\n", sub_type);
+			data += sub_len;
+			vsa_remaining -= sub_len;
+			continue;
+		}
+
+		const char *attrname = DA->name;
+		const uint8_t *sub_data = data + 2;
+		uint8_t sub_data_len = sub_len - 2;
+
+		switch (DA->type) {
+		case PW_TYPE_INTEGER: {
+			if (sub_data_len != 4) {
+				ULOG_ERR("VSA %s: expected 4 bytes, got %d\n", attrname, sub_data_len);
+				break;
+			}
+			uint32_t val = ntohl(*((uint32_t *)sub_data));
+			blobmsg_add_u32(b, attrname, val);
+			break;
+		}
+		case PW_TYPE_STRING: {
+			char strbuf[256];
+			if (sub_data_len >= sizeof(strbuf))
+				sub_data_len = sizeof(strbuf) - 1;
+			int valid = 1;
+			for (int i = 0; i < sub_data_len; i++) {
+				if (!isprint(sub_data[i])) {
+					valid = 0;
+					break;
+				}
+				strbuf[i] = (char)sub_data[i];
+			}
+			if (!valid) {
+				ULOG_ERR("VSA %s: non-printable string data\n", attrname);
+				break;
+			}
+			strbuf[sub_data_len] = '\0';
+			blobmsg_add_string(b, attrname, strbuf);
+			break;
+		}
+		case PW_TYPE_IPADDR: {
+			if (sub_data_len != 4) {
+				ULOG_ERR("VSA %s: expected 4 bytes for IP, got %d\n", attrname, sub_data_len);
+				break;
+			}
+			struct in_addr addr;
+			addr.s_addr = *((uint32_t *)sub_data);
+			blobmsg_add_string(b, attrname, inet_ntoa(addr));
+			break;
+		}
+		default:
+			ULOG_INFO("VSA %s: unsupported radcli type %d\n", attrname, DA->type);
+			break;
+		}
+
+		data += sub_len;
+		vsa_remaining -= sub_len;
+	}
+
+	return 0;
 }
 
 // AVP matching table for uspot callback
@@ -297,6 +428,13 @@ das_request_process(const struct das_request *drq)
 					break;
 			}
 		}
+		// parse Vendor-Specific attributes
+		else if (id == PW_VENDOR_SPECIFIC) {
+			if (parse_vendor_specific(tlv, &b)) {
+				ULOG_ERR("failed to parse Vendor-Specific AVP\n");
+				goto fail;
+			}
+		}
 
 		attrs_len -= tlv->len;
 		tlv = (const struct radius_tlv *)((char *)tlv + tlv->len);
@@ -373,7 +511,7 @@ uspot_das_cb(struct ubus_request *req, int type, struct blob_attr *msg)
  0+        0        0    18   Reply-Message (Note 2)		// NOT supported
  0         0        0    24   State
  0+        0        0    25   Class (Note 4)			// sent back unmodified
- 0+        0        0    26   Vendor-Specific (Note 7)		// NOT supported
+ 0+        0        0    26   Vendor-Specific (Note 7)		// supported (vendor 14559)
  0-1       0        0    30   Called-Station-Id (Note 1)	// session ident - supported
  0-1       0        0    31   Calling-Station-Id (Note 1)	// session ident - supported
  0-1       0        0    32   NAS-Identifier (Note 1)		// NAS ident - supported
@@ -404,6 +542,7 @@ disconnect_attrid_not_supported(uint8_t id)
 		case PW_NAS_IP_ADDRESS:
 		case PW_NAS_IDENTIFIER:
 		case PW_CLASS:
+		case PW_VENDOR_SPECIFIC:		// allow VSA for session identification
 		case PW_CALLED_STATION_ID:
 		case PW_CALLING_STATION_ID:
 		case PW_PROXY_STATE:
@@ -415,7 +554,6 @@ disconnect_attrid_not_supported(uint8_t id)
 		// allowed but not implemented
 		case PW_NAS_PORT:
 		case PW_REPLY_MESSAGE:
-		case PW_VENDOR_SPECIFIC:
 		case PW_ACCT_MULTI_SESSION_ID:
 		case PW_EVENT_TIMESTAMP:
 		case PW_EAP_MESSAGE:
@@ -497,7 +635,7 @@ das_disconnect_request(const struct radius_header *inbuf, struct radius_header *
  0-1       0        0    23   Framed-IPX-Network (Note 3)
  0-1       0-1      0-1  24   State				// supported
  0+        0        0    25   Class (Note 3)			// supported
- 0+        0        0    26   Vendor-Specific (Note 7)
+ 0+        0        0    26   Vendor-Specific (Note 7)		// supported (vendor 14559)
  0-1       0        0    27   Session-Timeout (Note 3)		// supported
  0-1       0        0    28   Idle-Timeout (Note 3)		// supported
  0-1       0        0    29   Termination-Action (Note 3)
@@ -576,6 +714,7 @@ coa_attrid_not_supported(uint8_t id)
 		case PW_NAS_IDENTIFIER:
 		case PW_STATE:
 		case PW_CLASS:
+		case PW_VENDOR_SPECIFIC:		// allow VSA for CoA changes
 		case PW_SESSION_TIMEOUT:	// change
 		case PW_IDLE_TIMEOUT:		// change
 		case PW_CALLED_STATION_ID:
